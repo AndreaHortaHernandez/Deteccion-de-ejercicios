@@ -1,0 +1,14 @@
+# datos personales y archivos pesados: viven en Google Drive, no en el repo
+videos/
+datos/
+pruebas/
+salidas/
+modelos/*.task
+modelos/*.joblib
+*.mp4
+*.mov
+*.avi
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
