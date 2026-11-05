@@ -52,8 +52,8 @@ def cargar_sesiones(dir_datos):
             print(f"  (se ignora {csv.name}: nombre no válido)")
             continue
         t, A = pose.leer_sesion(csv)
-        if len(A) < config.VENTANA:
-            print(f"  (se ignora {csv.name}: muy pocos frames con pose)")
+        if len(A) < config.MIN_FRAMES_VENTANA or t[-1] - t[0] < config.VENTANA_S:
+            print(f"  (se ignora {csv.name}: muy pocos cuadros con pose)")
             continue
         sesiones.append({"persona": csv.parent.name, "id": f"{csv.parent.name}/{csv.stem}",
                          "ejercicio": partes[0], "etiqueta": partes[1], "t": t, "A": A})
@@ -63,9 +63,7 @@ def cargar_sesiones(dir_datos):
 def dataset_ejercicio(sesiones, por_persona):
     X, y, g = [], [], []
     for s in sesiones:
-        A = s["A"]
-        for i in range(0, len(A) - config.VENTANA + 1, config.PASO_VENTANA):
-            W = A[i:i + config.VENTANA]
+        for W in pose.ventanas(s["t"], s["A"]):
             if not pose.hay_movimiento(W):
                 continue
             X.append(pose.rasgos_ventana(W))

@@ -127,6 +127,22 @@ def rasgos_ventana(A):
     return np.concatenate([A.mean(0), A.std(0), A.min(0), A.max(0)])
 
 
+def ventanas(t, A):
+    """Corta una sesión en ventanas de VENTANA_S segundos cada PASO_S segundos.
+    Devuelve una lista de arreglos de ángulos (solo ventanas con suficientes cuadros)."""
+    t = np.asarray(t)
+    res = []
+    if len(t) == 0:
+        return res
+    inicio = t[0]
+    while inicio + config.VENTANA_S <= t[-1] + 1e-6:
+        m = (t >= inicio) & (t < inicio + config.VENTANA_S)
+        if m.sum() >= config.MIN_FRAMES_VENTANA:
+            res.append(A[m])
+        inicio += config.PASO_S
+    return res
+
+
 ESTAD_REP = ["min", "max", "media", "std", "rango"]
 NOMBRES_RASGOS_REP = [f"{a}_{e}" for e in ESTAD_REP for a in ANGULOS] + ["duracion_s"]
 
@@ -149,8 +165,9 @@ class ContadorReps:
     """Segmenta repeticiones con el ángulo principal del ejercicio (rodilla o codo).
 
     Una rep empieza cuando el ángulo baja DELTA_INICIO grados desde el máximo reciente
-    (posición extendida) y termina cuando vuelve a quedar a menos de DELTA_FIN de ese máximo.
-    Así se cuentan también las reps mal hechas (p. ej. sentadillas poco profundas).
+    (posición extendida) y termina cuando recupera RECUPERACION (70 %) del recorrido entre
+    ese máximo y el mínimo de la rep. Así se cuentan también las reps mal hechas (poco
+    profundas) y no se juntan dos reps cuando la persona no se estira por completo.
     """
 
     def __init__(self, nombre_angulo):
@@ -160,6 +177,7 @@ class ContadorReps:
     def reset(self):
         self.estado = "arriba"
         self.tope = -1.0
+        self.minimo = 999.0
         self.desde_tope = []   # frames (angulos, t) desde el último máximo
         self.rep = []
 
@@ -175,14 +193,16 @@ class ContadorReps:
             if a < self.tope - config.DELTA_INICIO:
                 self.estado = "abajo"
                 self.rep = list(self.desde_tope)
+                self.minimo = a
             return None
         # estado "abajo"
         self.rep.append((A_frame, t))
+        self.minimo = min(self.minimo, a)
         dur = t - self.rep[0][1]
         if dur > config.MAX_DUR_REP:
             self.reset()
             return None
-        if a > self.tope - config.DELTA_FIN:
+        if a >= self.minimo + config.RECUPERACION * (self.tope - self.minimo):
             rep = self.rep
             self.reset()
             self.tope = a
@@ -214,9 +234,9 @@ class Analizador:
             r = dir_modelos / f"tecnica_{ej}.joblib"
             if r.exists():
                 self.m_tec[ej] = joblib.load(r)
-        self.buf = deque(maxlen=config.VENTANA)
+        self.buf = deque()      # (angulos, t) de los últimos VENTANA_S segundos
         self.votos = deque(maxlen=config.SUAVIZADO)
-        self.n = 0
+        self.t_pred = -1e9
         self.ejercicio = None
         self.contador = None
         self.conteo = {ej: {"reps": 0, "bien": 0, "mal": 0} for ej in config.EJERCICIOS}
@@ -235,8 +255,11 @@ class Analizador:
         if A is None:
             return None
         self.buf.append((A, t))
-        self.n += 1
-        if len(self.buf) == config.VENTANA and self.n % config.PASO_VENTANA == 0:
+        while self.buf and t - self.buf[0][1] > config.VENTANA_S:
+            self.buf.popleft()
+        lleno = t - self.buf[0][1] >= 0.9 * config.VENTANA_S and len(self.buf) >= config.MIN_FRAMES_VENTANA
+        if lleno and t - self.t_pred >= config.PASO_S:
+            self.t_pred = t
             W = np.array([a for a, _ in self.buf])
             pred = None
             if hay_movimiento(W):
@@ -247,16 +270,35 @@ class Analizador:
             self.votos.append(pred)
             nuevo = self._votar()
             if nuevo is not None and nuevo != self.ejercicio:
-                self.ejercicio = nuevo
-                self.contador = ContadorReps(config.EJERCICIOS[nuevo]["angulo"])
-                for a, tt in list(self.buf)[:-1]:   # recupera la rep que ya iba empezando
-                    self.contador.actualizar(a, tt)
+                return self._cambiar_ejercicio(nuevo)
         if self.contador is None:
             return None
         rep = self.contador.actualizar(A, t)
         if rep is None:
             return None
         return self._evaluar(*rep)
+
+    def _cambiar_ejercicio(self, nuevo):
+        """El reconocimiento va 1-2 s atrasado: las reps del ejercicio anterior que terminaron
+        dentro de la ventana actual en realidad eran del nuevo. Se deshacen y la ventana se
+        vuelve a procesar con el contador del ejercicio nuevo."""
+        t0 = self.buf[0][1]
+        while self.historial and self.historial[-1]["ejercicio"] == self.ejercicio \
+                and self.historial[-1]["t"] >= t0:
+            v = self.historial.pop()
+            c = self.conteo[v["ejercicio"]]
+            c["reps"] -= 1
+            if v["ok"] is not None:
+                c["bien" if v["ok"] else "mal"] -= 1
+        self.ultimo = self.historial[-1] if self.historial else None
+        self.ejercicio = nuevo
+        self.contador = ContadorReps(config.EJERCICIOS[nuevo]["angulo"])
+        veredicto = None
+        for a, tt in list(self.buf):
+            rep = self.contador.actualizar(a, tt)
+            if rep is not None:
+                veredicto = self._evaluar(*rep)
+        return veredicto
 
     def _evaluar(self, A_rep, t_rep):
         ej = self.ejercicio
