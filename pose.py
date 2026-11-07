@@ -1,9 +1,10 @@
-"""Detección de pose (MediaPipe), cálculo de ángulos, rasgos y conteo de repeticiones.
+"""Detección de pose (MediaPipe), señales por cuadro, rasgos y conteo de repeticiones.
 
 Todo lo que se usa al entrenar y en vivo sale de aquí, para que ambos calculen exactamente lo mismo.
 """
 import csv
 import math
+import warnings
 from collections import deque
 
 import cv2
@@ -16,7 +17,11 @@ PUNTOS = {
     "hombro": (11, 12), "codo": (13, 14), "muneca": (15, 16),
     "cadera": (23, 24), "rodilla": (25, 26), "tobillo": (27, 28),
 }
+PIE = (31, 32)  # punta del pie
 ANGULOS = ["rodilla", "cadera", "codo", "hombro", "torso", "linea_cuerpo"]
+# medidas normalizadas por la longitud del segmento (no dependen de la distancia a la cámara)
+MEDIDAS = ["prof_cadera", "rodilla_pie"]
+SENALES = ANGULOS + MEDIDAS
 CONEXIONES = [(11, 12), (11, 13), (13, 15), (12, 14), (14, 16), (11, 23), (12, 24),
               (23, 24), (23, 25), (25, 27), (24, 26), (26, 28), (27, 31), (28, 32)]
 N_PUNTOS = 33
@@ -76,7 +81,7 @@ def asegurar_modelo_pose(ruta=config.MODELO_POSE):
     return ruta
 
 
-# ----------------------------------------------------------------- ángulos
+# ----------------------------------------------------------------- señales
 def _ang(a, b, c):
     """Ángulo ABC en grados (0-180)."""
     v1, v2 = a - b, c - b
@@ -86,50 +91,127 @@ def _ang(a, b, c):
     return math.degrees(math.acos(float(np.clip(np.dot(v1, v2) / n, -1.0, 1.0))))
 
 
-def angulos(lm, w, h):
-    """Calcula los 6 ángulos (orden de ANGULOS) usando el lado del cuerpo más visible.
+def visibilidad_lados(lm):
+    """Suma de visibilidad de hombro, codo, muñeca, cadera, rodilla y tobillo de cada lado."""
+    return np.array([sum(lm[PUNTOS[p][lado], 3] for p in PUNTOS) for lado in (0, 1)])
 
-    Devuelve None si el tronco y el brazo no se ven bien (se descarta el frame).
+
+def senales(lm, w, h, lado):
+    """Calcula las señales (orden de SENALES) con el lado del cuerpo indicado (0 izq., 1 der.).
+
+    Devuelve None si el tronco y el brazo no se ven bien (se descarta el frame). Las señales que
+    usan la pierna quedan en NaN si la rodilla o el tobillo no se ven (en el curl a veces salen
+    del cuadro): así no entra basura a los rasgos.
     """
     if lm is None:
         return None
-    # lado más visible: suma de visibilidad de hombro, codo, muñeca, cadera, rodilla y tobillo
-    vis = [sum(lm[PUNTOS[p][lado], 3] for p in PUNTOS) for lado in (0, 1)]
-    lado = 0 if vis[0] >= vis[1] else 1
     idx = {p: PUNTOS[p][lado] for p in PUNTOS}
-    # el tronco y el brazo deben verse; las piernas pueden salir del cuadro (curl)
+    idx["pie"] = PIE[lado]
     if min(lm[idx[p], 3] for p in ("hombro", "codo", "muneca", "cadera")) < config.VIS_MIN:
         return None
+    ve = {p: lm[i, 3] >= config.VIS_MIN for p, i in idx.items()}
     P = {p: lm[i, :2] * np.array([w, h], dtype=np.float32) for p, i in idx.items()}
+    nan = float("nan")
     torso = P["hombro"] - P["cadera"]
     inclinacion = math.degrees(math.atan2(abs(torso[0]), -torso[1]))  # 0 = torso vertical, 90 = horizontal
+    rodilla, tobillo = ve["rodilla"], ve["rodilla"] and ve["tobillo"]
+    muslo = float(np.linalg.norm(P["rodilla"] - P["cadera"]))
+    espinilla = float(np.linalg.norm(P["rodilla"] - P["tobillo"]))
+    # profundidad: + si la cadera está más abajo que la rodilla (la y de la imagen crece hacia abajo)
+    prof = (P["cadera"][1] - P["rodilla"][1]) / muslo if rodilla and muslo > 1e-6 else nan
+    # rodilla delante de la punta del pie (+), en el sentido en que apunta el pie
+    if tobillo and ve["pie"] and espinilla > 1e-6:
+        sentido = 1.0 if P["pie"][0] >= P["tobillo"][0] else -1.0
+        rod_pie = (P["rodilla"][0] - P["pie"][0]) * sentido / espinilla
+    else:
+        rod_pie = nan
     valores = [
-        _ang(P["cadera"], P["rodilla"], P["tobillo"]),
-        _ang(P["hombro"], P["cadera"], P["rodilla"]),
+        _ang(P["cadera"], P["rodilla"], P["tobillo"]) if tobillo else nan,
+        _ang(P["hombro"], P["cadera"], P["rodilla"]) if rodilla else nan,
         _ang(P["hombro"], P["codo"], P["muneca"]),
         _ang(P["codo"], P["hombro"], P["cadera"]),
         inclinacion,
-        _ang(P["hombro"], P["cadera"], P["tobillo"]),
+        _ang(P["hombro"], P["cadera"], P["tobillo"]) if ve["tobillo"] else nan,
+        prof,
+        rod_pie,
     ]
-    if any(math.isnan(v) for v in valores):
+    if any(math.isnan(valores[SENALES.index(s)]) for s in ("codo", "hombro", "torso")):
         return None
     return np.array(valores, dtype=np.float32)
 
 
+def _nan_mediana(H):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # columnas todas NaN -> NaN
+        return np.nanmedian(H, axis=0).astype(np.float32)
+
+
+class ProcesadorPose:
+    """Landmarks de cada cuadro -> vector de señales. Se usa igual al entrenar y en vivo.
+
+    - Lado del cuerpo: se fija con histéresis sobre la visibilidad suavizada. Elegirlo en cada
+      cuadro (v1) hacía que los ángulos saltaran de un brazo al otro cuando la visibilidad oscilaba.
+    - Mediana móvil causal de MEDIANA_FRAMES cuadros contra el temblor de MediaPipe (solo usa
+      cuadros pasados, así que sirve en vivo).
+    """
+
+    def __init__(self):
+        self.lado = None
+        self.vis = None
+        self.hist = deque(maxlen=max(1, config.MEDIANA_FRAMES))
+
+    def __call__(self, lm, w, h):
+        if lm is None:
+            return None
+        v = visibilidad_lados(lm)
+        if not config.LADO_FIJO or self.lado is None:
+            self.vis = v
+            lado = int(np.argmax(v))
+        else:
+            self.vis = (1 - config.ALFA_LADO) * self.vis + config.ALFA_LADO * v
+            lado = self.lado
+            if self.vis[1 - lado] > self.vis[lado] + config.HISTERESIS_LADO:
+                lado = 1 - lado
+        if lado != self.lado:
+            self.hist.clear()  # no mezclar en la mediana cuadros de los dos lados
+            self.lado = lado
+        s = senales(lm, w, h, lado)
+        if s is None:
+            return None
+        self.hist.append(s)
+        return s if len(self.hist) == 1 else _nan_mediana(np.array(self.hist))
+
+
 # ----------------------------------------------------------------- rasgos
-ESTAD_VENTANA = ["media", "std", "min", "max"]
-NOMBRES_RASGOS_VENTANA = [f"{a}_{e}" for e in ESTAD_VENTANA for a in ANGULOS]
+def _nombres_estad():
+    bajo, alto = ("min", "max") if config.ESTADISTICOS == "minmax" else ("p05", "p95")
+    return ["media", "std", bajo, alto]
+
+
+def _estad(A):
+    """Media, desviación y extremos (p5/p95 o mín./máx.) de cada columna, ignorando NaN."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        if config.ESTADISTICOS == "minmax":
+            bajo, alto = np.nanmin(A, 0), np.nanmax(A, 0)
+        else:
+            bajo, alto = np.nanpercentile(A, 5, axis=0), np.nanpercentile(A, 95, axis=0)
+        return [np.nanmean(A, 0), np.nanstd(A, 0), bajo, alto]
+
+
+def nombres_rasgos_ventana():
+    return [f"{s}_{e}" for e in _nombres_estad() for s in SENALES]
 
 
 def rasgos_ventana(A):
-    """A: (n, 6) ángulos de una ventana -> 24 rasgos para reconocer el ejercicio."""
-    A = np.asarray(A, dtype=np.float32)
-    return np.concatenate([A.mean(0), A.std(0), A.min(0), A.max(0)])
+    """A: (n, señales) de una ventana -> rasgos para reconocer el ejercicio."""
+    return np.concatenate(_estad(np.asarray(A, dtype=np.float64))).astype(np.float32)
 
 
-def ventanas(t, A):
-    """Corta una sesión en ventanas de VENTANA_S segundos cada PASO_S segundos.
-    Devuelve una lista de arreglos de ángulos (solo ventanas con suficientes cuadros)."""
+def ventanas(t, A, paso=None):
+    """Corta una sesión en ventanas de VENTANA_S segundos cada `paso` segundos (PASO_S por defecto).
+    Devuelve una lista de arreglos de señales (solo ventanas con suficientes cuadros)."""
+    paso = config.PASO_S if paso is None else paso
     t = np.asarray(t)
     res = []
     if len(t) == 0:
@@ -139,25 +221,93 @@ def ventanas(t, A):
         m = (t >= inicio) & (t < inicio + config.VENTANA_S)
         if m.sum() >= config.MIN_FRAMES_VENTANA:
             res.append(A[m])
-        inicio += config.PASO_S
+        inicio += paso
     return res
 
 
-ESTAD_REP = ["min", "max", "media", "std", "rango"]
-NOMBRES_RASGOS_REP = [f"{a}_{e}" for e in ESTAD_REP for a in ANGULOS] + ["duracion_s"]
+FASE = ["fase_duracion_s", "fase_bajada_s", "fase_subida_s", "fase_fraccion_bajada",
+        "fase_vel_bajada", "fase_vel_subida", "fase_recorrido"]
 
 
-def rasgos_rep(A, t):
-    """A: (n, 6) ángulos de una repetición, t: tiempos en s -> 31 rasgos para evaluar la técnica."""
-    A = np.asarray(A, dtype=np.float32)
-    mn, mx = A.min(0), A.max(0)
-    return np.concatenate([mn, mx, A.mean(0), A.std(0), mx - mn, [float(t[-1] - t[0])]])
+ESTAD_BASICOS = ["min", "max", "media", "std", "rango"]
+
+
+def nombres_rasgos_rep():
+    """Familias (config.RASGOS_REP):
+    basicos -> mín., máx., media, desv. y rango de los 6 ángulos + duración (los de la versión 1)
+    estad -> media, desv. y extremos de cada señal en toda la rep (rasgos genéricos)
+    fase  -> duración de bajada y subida, velocidad angular máxima y recorrido del ángulo principal
+    flex  -> valor de cada señal en el punto de máxima flexión (fondo de la sentadilla, pecho
+             abajo en la lagartija, codo arriba en el curl): ahí se ve casi todo error de técnica
+    """
+    nombres = []
+    if "basicos" in config.RASGOS_REP:
+        nombres += [f"bas_{s}_{e}" for e in ESTAD_BASICOS for s in ANGULOS] + ["bas_duracion_s"]
+    if "estad" in config.RASGOS_REP:
+        nombres += [f"{s}_{e}" for e in _nombres_estad() for s in SENALES]
+    if "fase" in config.RASGOS_REP:
+        nombres += FASE
+    if "flex" in config.RASGOS_REP:
+        nombres += [f"flex_{s}" for s in SENALES]
+    return nombres
+
+
+def rasgos_rep(A, t, k):
+    """A: (n, señales) de una repetición, t: tiempos en s, k: índice del ángulo principal."""
+    A = np.asarray(A, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64)
+    a = A[:, k]
+    i = int(np.nanargmin(a))  # máxima flexión
+    partes = []
+    if "basicos" in config.RASGOS_REP:
+        B = A[:, :len(ANGULOS)]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            mn, mx = np.nanmin(B, 0), np.nanmax(B, 0)
+            partes += [mn, mx, np.nanmean(B, 0), np.nanstd(B, 0), mx - mn, [t[-1] - t[0]]]
+    if "estad" in config.RASGOS_REP:
+        partes += _estad(A)
+    if "fase" in config.RASGOS_REP:
+        dur, bajada, subida = t[-1] - t[0], t[i] - t[0], t[-1] - t[i]
+        dt = np.diff(t)
+        v = np.diff(a) / np.where(dt > 0, dt, np.nan)  # grados por segundo
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            v_baja = -np.nanmin(v[:i]) if i > 0 else 0.0
+            v_sube = np.nanmax(v[i:]) if i < len(v) else 0.0
+        partes.append([dur, bajada, subida, bajada / dur if dur > 0 else 0.5,
+                       v_baja, v_sube, np.nanmax(a) - np.nanmin(a)])
+    if "flex" in config.RASGOS_REP:
+        partes.append(A[i])
+    return np.concatenate([np.ravel(p) for p in partes]).astype(np.float32)
+
+
+def nombres_secuencia():
+    return [f"{s}_t{j:02d}" for s in SENALES for j in range(config.PUNTOS_SECUENCIA)]
+
+
+def secuencia_rep(A, t):
+    """Remuestrea la rep a PUNTOS_SECUENCIA instantes (tiempo normalizado 0-1) -> vector plano
+    (señal x tiempo) para modelos de series de tiempo como ROCKET."""
+    A = np.asarray(A, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64)
+    u = (t - t[0]) / max(t[-1] - t[0], 1e-6)
+    malla = np.linspace(0, 1, config.PUNTOS_SECUENCIA)
+    S = np.full((A.shape[1], len(malla)), np.nan)
+    for c in range(A.shape[1]):
+        ok = ~np.isnan(A[:, c])
+        if ok.sum() >= 2:
+            S[c] = np.interp(malla, u[ok], A[ok, c])
+    return S.ravel().astype(np.float32)
 
 
 def hay_movimiento(A):
     """True si el codo o la rodilla se mueven lo suficiente en la ventana."""
-    A = np.asarray(A)
-    return max(A[:, ANGULOS.index("codo")].std(), A[:, ANGULOS.index("rodilla")].std()) >= config.UMBRAL_MOVIMIENTO
+    A = np.asarray(A, dtype=np.float64)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        d = [np.nanstd(A[:, SENALES.index(s)]) for s in ("codo", "rodilla")]
+    return float(np.max(np.nan_to_num(d))) >= config.UMBRAL_MOVIMIENTO
 
 
 # ----------------------------------------------------------------- repeticiones
@@ -168,31 +318,39 @@ class ContadorReps:
     (posición extendida) y termina cuando recupera RECUPERACION (70 %) del recorrido entre
     ese máximo y el mínimo de la rep. Así se cuentan también las reps mal hechas (poco
     profundas) y no se juntan dos reps cuando la persona no se estira por completo.
+    Los cuadros en los que no se ve el ángulo principal se ignoran.
     """
 
-    def __init__(self, nombre_angulo):
-        self.k = ANGULOS.index(nombre_angulo)
+    def __init__(self, nombre_angulo, delta_inicio=None, recuperacion=None):
+        self.k = SENALES.index(nombre_angulo)
+        self.delta = config.DELTA_INICIO if delta_inicio is None else delta_inicio
+        self.recup = config.RECUPERACION if recuperacion is None else recuperacion
         self.reset()
 
     def reset(self):
         self.estado = "arriba"
         self.tope = -1.0
         self.minimo = 999.0
-        self.desde_tope = []   # frames (angulos, t) desde el último máximo
+        self.desde_tope = []   # frames (señales, t) desde el último máximo
         self.rep = []
 
     def actualizar(self, A_frame, t):
-        """Agrega un frame. Devuelve (angulos_rep, tiempos_rep) cuando se completa una rep; si no, None."""
+        """Agrega un frame. Devuelve (señales_rep, tiempos_rep) cuando se completa una rep; si no, None."""
         a = float(A_frame[self.k])
+        if math.isnan(a):
+            return None
         if self.estado == "arriba":
             if a >= self.tope:
                 self.tope = a
                 self.desde_tope = [(A_frame, t)]
             else:
                 self.desde_tope.append((A_frame, t))
-            if a < self.tope - config.DELTA_INICIO:
+            if a < self.tope - self.delta:
                 self.estado = "abajo"
-                self.rep = list(self.desde_tope)
+                # la rep empieza justo antes de bajar, no en el máximo (que puede estar en la pausa de arriba)
+                cerca = [i for i, (f, _) in enumerate(self.desde_tope)
+                         if float(f[self.k]) >= self.tope - config.TOLERANCIA_INICIO]
+                self.rep = list(self.desde_tope[cerca[-1]:])
                 self.minimo = a
             return None
         # estado "abajo"
@@ -202,7 +360,7 @@ class ContadorReps:
         if dur > config.MAX_DUR_REP:
             self.reset()
             return None
-        if a >= self.minimo + config.RECUPERACION * (self.tope - self.minimo):
+        if a >= self.minimo + self.recup * (self.tope - self.minimo):
             rep = self.rep
             self.reset()
             self.tope = a
@@ -213,12 +371,30 @@ class ContadorReps:
         return None
 
 
+def contar_reps(t, A, ejercicio, **kw):
+    """Corre el contador sobre una sesión completa. Devuelve la lista de (señales_rep, tiempos_rep)."""
+    cont = ContadorReps(config.EJERCICIOS[ejercicio]["angulo"], **kw)
+    reps = []
+    for a, tt in zip(A, t):
+        r = cont.actualizar(a, tt)
+        if r is not None:
+            reps.append(r)
+    return reps
+
+
 # ----------------------------------------------------------------- análisis completo
+def _comprobar_rasgos(m, esperados, ruta):
+    if m.get("rasgos") != esperados:
+        raise ValueError(f"{ruta} se entrenó con otros rasgos (otra versión o config distinta). "
+                         "Vuelve a correr entrenar.py.")
+
+
 class Analizador:
     """Junta todo: reconoce el ejercicio, cuenta reps y evalúa la técnica de cada una.
 
-    Se alimenta frame por frame con `paso(angulos, t)`; lo usan analizar_video.py,
-    en_vivo.py y la celda de cámara del notebook.
+    Se alimenta frame por frame con `paso_pose(landmarks, w, h, t)` (o `paso(señales, t)` si ya
+    se calcularon); lo usan analizar_video.py, en_vivo.py, la celda de cámara del notebook y
+    evaluar_sistema.py.
     """
 
     def __init__(self, dir_modelos=config.DIR_MODELOS):
@@ -229,12 +405,30 @@ class Analizador:
         if not ruta.exists():
             raise FileNotFoundError(f"No hay modelo de ejercicio en {ruta}. Corre primero entrenar.py.")
         self.m_ej = joblib.load(ruta)
+        _comprobar_rasgos(self.m_ej, nombres_rasgos_ventana(), ruta)
         self.m_tec = {}
         for ej in config.EJERCICIOS:
             r = dir_modelos / f"tecnica_{ej}.joblib"
             if r.exists():
-                self.m_tec[ej] = joblib.load(r)
-        self.buf = deque()      # (angulos, t) de los últimos VENTANA_S segundos
+                m = joblib.load(r)
+                _comprobar_rasgos(m, nombres_secuencia() if m.get("entrada") == "secuencia"
+                                  else nombres_rasgos_rep(), r)
+                self.m_tec[ej] = m
+        # modelo opcional que dice QUÉ error es (solo si se grabaron errores específicos)
+        self.m_err = {}
+        for ej in config.EJERCICIOS:
+            r = dir_modelos / f"error_{ej}.joblib"
+            if r.exists():
+                m = joblib.load(r)
+                _comprobar_rasgos(m, nombres_secuencia() if m.get("entrada") == "secuencia"
+                                  else nombres_rasgos_rep(), r)
+                self.m_err[ej] = m
+        self.reiniciar()
+
+    def reiniciar(self):
+        """Vuelve a empezar el conteo (sin volver a cargar los modelos)."""
+        self.proc = ProcesadorPose()
+        self.buf = deque()      # (señales, t) de los últimos VENTANA_S segundos
         self.votos = deque(maxlen=config.SUAVIZADO)
         self.t_pred = -1e9
         self.ejercicio = None
@@ -242,6 +436,11 @@ class Analizador:
         self.conteo = {ej: {"reps": 0, "bien": 0, "mal": 0} for ej in config.EJERCICIOS}
         self.ultimo = None      # veredicto de la última rep
         self.historial = []     # todas las reps evaluadas
+        self.t_serie = -1e9     # inicio de la serie actual (cuando se reconoció el ejercicio)
+
+    def paso_pose(self, lm, w, h, t):
+        """Procesa los landmarks de un frame (o None si no se detectó a nadie)."""
+        return self.paso(self.proc(lm, w, h), t)
 
     def _votar(self):
         validos = [v for v in self.votos if v is not None]
@@ -251,7 +450,7 @@ class Analizador:
         return mejor if validos.count(mejor) > len(self.votos) // 2 else None
 
     def paso(self, A, t):
-        """Procesa un frame. Devuelve el veredicto si en este frame terminó una rep; si no, None."""
+        """Procesa las señales de un frame. Devuelve el veredicto si en este frame terminó una rep; si no, None."""
         if A is None:
             return None
         self.buf.append((A, t))
@@ -292,6 +491,7 @@ class Analizador:
                 c["bien" if v["ok"] else "mal"] -= 1
         self.ultimo = self.historial[-1] if self.historial else None
         self.ejercicio = nuevo
+        self.t_serie = t0
         self.contador = ContadorReps(config.EJERCICIOS[nuevo]["angulo"])
         veredicto = None
         for a, tt in list(self.buf):
@@ -304,22 +504,45 @@ class Analizador:
         ej = self.ejercicio
         c = self.conteo[ej]
         c["reps"] += 1
-        if ej not in self.m_tec:
-            v = {"ejercicio": ej, "rep": c["reps"], "etiqueta": None, "ok": None,
-                 "texto": "Sin modelo de técnica para este ejercicio", "prob": 0.0, "t": float(t_rep[-1])}
-        else:
+        v = {"ejercicio": ej, "rep": c["reps"], "etiqueta": None, "ok": None, "prob": 0.0, "p_mal": None,
+             "error": None,
+             "texto": "Sin modelo de técnica para este ejercicio", "t": float(t_rep[-1]),
+             "t_inicio": float(t_rep[0])}
+        if ej in self.m_tec:
             m = self.m_tec[ej]
-            p = m["modelo"].predict_proba(rasgos_rep(A_rep, t_rep)[None])[0]
-            i = int(np.argmax(p))
-            et = m["clases"][i]
+            x = (secuencia_rep(A_rep, t_rep) if m.get("entrada") == "secuencia"
+                 else rasgos_rep(A_rep, t_rep, self.contador.k))[None]
+            p = m["modelo"].predict_proba(x)[0]
+            et = m["modelo"].predict(x)[0]  # aplica el umbral de p(mal) elegido al entrenar
             ok = et == "bien"
             c["bien" if ok else "mal"] += 1
-            v = {"ejercicio": ej, "rep": c["reps"], "etiqueta": et, "ok": ok,
-                 "texto": config.EJERCICIOS[ej]["etiquetas"].get(et, et), "prob": float(p[i]),
-                 "t": float(t_rep[-1])}
+            v.update(etiqueta=et, ok=ok, texto=config.EJERCICIOS[ej]["etiquetas"].get(et, et),
+                     prob=float(p[list(m["clases"]).index(et)]),
+                     p_mal=float(p[list(m["clases"]).index("mal")]) if "mal" in m["clases"] else None)
+            if not ok and ej in self.m_err:
+                me = self.m_err[ej]
+                xe = (secuencia_rep(A_rep, t_rep) if me.get("entrada") == "secuencia"
+                      else rasgos_rep(A_rep, t_rep, self.contador.k))[None]
+                err = me["modelo"].predict(xe)[0]
+                v.update(error=err, texto=config.EJERCICIOS[ej].get("errores", {}).get(err, err))
         self.ultimo = v
         self.historial.append(v)
         return v
+
+    def veredicto_serie(self):
+        """Veredicto de la serie actual: promedio de p(mal) de sus reps.
+
+        Con el dataset real, decidir por serie (o video) acierta bastante más que rep por rep
+        (acierto balanceado ~0.70 vs ~0.60): una sola rep es ruidosa, pero el patrón de "mala técnica"
+        se repite en toda la serie. Devuelve (ok, p_mal_media, n_reps) o None si aún no hay suficientes.
+        """
+        ps = [v["p_mal"] for v in self.historial
+              if v["ejercicio"] == self.ejercicio and v["p_mal"] is not None and v["t"] >= self.t_serie]
+        if len(ps) < config.MIN_REPS_SERIE:
+            return None
+        umbral = self.m_tec.get(self.ejercicio, {}).get("umbral_mal") or 0.5
+        media = float(np.mean(ps))
+        return media < umbral, media, len(ps)
 
     def dibujar_hud(self, img, t_actual):
         """Escribe sobre img (BGR) el ejercicio, el conteo y el veredicto de la última rep."""
@@ -332,6 +555,11 @@ class Analizador:
             c = self.conteo[ej]
             texto(img, f"Reps: {c['reps']}   Bien: {c['bien']}   Mal: {c['mal']}",
                   (15, int(75 * esc / 0.6)), 0.8 * esc)
+            s = self.veredicto_serie()
+            if s:
+                ok, media, n = s
+                texto(img, f"Serie ({n} reps): {'BUENA TECNICA' if ok else 'A CORREGIR'}  p(mal) {media:.0%}",
+                      (15, int(110 * esc / 0.6)), 0.8 * esc, (80, 220, 80) if ok else (60, 60, 255))
         v = self.ultimo
         if v and t_actual - v["t"] < 3.0:
             color = (80, 220, 80) if v["ok"] else (60, 60, 255) if v["ok"] is False else (200, 200, 200)
@@ -351,16 +579,27 @@ def guardar_sesion(ruta, filas, w, h):
             wr.writerow([f"{t:.4f}", w, h] + [f"{v:.5f}" for v in lm.reshape(-1)])
 
 
-def leer_sesion(ruta):
-    """Devuelve (t, A): tiempos y ángulos de los frames válidos de un CSV de sesión."""
+def leer_landmarks(ruta):
+    """Devuelve (t, LM (n, 33, 4), w, h) tal como están en el CSV de sesión."""
     datos = np.loadtxt(ruta, delimiter=",", skiprows=1, ndmin=2)
+    return datos[:, 0], datos[:, 3:].reshape(-1, N_PUNTOS, 4), datos[:, 1], datos[:, 2]
+
+
+def senales_sesion(t, LM, w, h):
+    """Pasa los landmarks de una sesión por un ProcesadorPose nuevo -> (t, A) de los frames válidos."""
+    proc = ProcesadorPose()
     ts, filas = [], []
-    for fila in datos:
-        a = angulos(fila[3:].reshape(N_PUNTOS, 4), fila[1], fila[2])
+    for ti, lm, wi, hi in zip(t, LM, w, h):
+        a = proc(lm, wi, hi)
         if a is not None:
-            ts.append(fila[0])
+            ts.append(ti)
             filas.append(a)
-    return np.array(ts), np.array(filas).reshape(-1, len(ANGULOS))
+    return np.array(ts), np.array(filas, dtype=np.float32).reshape(-1, len(SENALES))
+
+
+def leer_sesion(ruta):
+    """Devuelve (t, A): tiempos y señales de los frames válidos de un CSV de sesión."""
+    return senales_sesion(*leer_landmarks(ruta))
 
 
 # ----------------------------------------------------------------- dibujo

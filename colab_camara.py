@@ -128,7 +128,7 @@ def correr(dir_modelos=config.DIR_MODELOS, max_segundos=900):
             h, w = frame.shape[:2]
             t = time.monotonic() - t0
             lm = det.detectar(frame, t * 1000)
-            analizador.paso(pose.angulos(lm, w, h), t)
+            analizador.paso_pose(lm, w, h, t)
             lienzo = np.empty((h, w, 3), np.uint8)
             lienzo[:] = _CLAVE
             pose.dibujar(lienzo, lm)

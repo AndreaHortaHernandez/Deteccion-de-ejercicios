@@ -2,7 +2,7 @@
 
 Estructura esperada de los videos:
     <videos>/<apellido_nombre>/<ejercicio>__<etiqueta>__<n>.mp4
-    ej. videos/horta_andrea/sentadilla__poco_profunda__2.mp4
+    ej. videos/horta_andrea/sentadilla__mal__2.mp4
 
 Salida: <datos>/<apellido_nombre>/<mismo_nombre>.csv
 Los videos ya procesados se saltan (si el CSV existe y es más nuevo que el video).
@@ -11,6 +11,7 @@ Uso:
     python extraer_videos.py --videos /ruta/videos --datos /ruta/datos
 """
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -20,7 +21,6 @@ import config
 import pose
 
 EXT = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm", ".3gp"}
-ANCHO_MAX = 640  # se reduce el video a este ancho: la pose no necesita más y es mucho más rápido
 
 
 def validar_nombre(ruta):
@@ -31,9 +31,33 @@ def validar_nombre(ruta):
     ej, et = partes[0].lower(), partes[1].lower()
     if ej not in config.EJERCICIOS:
         raise ValueError(f"ejercicio '{ej}' no válido; usa: {', '.join(config.EJERCICIOS)}")
-    if et not in config.EJERCICIOS[ej]["etiquetas"]:
-        raise ValueError(f"etiqueta '{et}' no válida para {ej}; usa: {', '.join(config.EJERCICIOS[ej]['etiquetas'])}")
+    if config.clasificar_etiqueta(ej, et) is None:
+        validas = list(config.EJERCICIOS[ej]["etiquetas"]) + list(config.EJERCICIOS[ej].get("errores", {}))
+        raise ValueError(f"etiqueta '{et}' no válida para {ej}; usa: {', '.join(validas)}")
     return ej, et
+
+
+def actualizar_conteos(dir_datos, ids):
+    """Agrega a <datos>/conteos_reales.csv una fila vacía por cada video que todavía no esté, para
+    anotar a mano cuántas repeticiones se hicieron (PROTOCOLO_GRABACION.md). Nunca borra lo anotado."""
+    ruta = dir_datos / "conteos_reales.csv"
+    filas = []
+    if ruta.exists():
+        with open(ruta, encoding="utf-8") as fh:
+            filas = list(csv.DictReader(fh))
+    ya = {f["id"] for f in filas}
+    nuevos = [i for i in ids if i not in ya]
+    if not nuevos:
+        return 0
+    for i in nuevos:
+        ej, et = i.split("/")[-1].split("__")[:2]
+        filas.append({"id": i, "ejercicio": ej, "etiqueta": et, "reps_reales": ""})
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    with open(ruta, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=["id", "ejercicio", "etiqueta", "reps_reales"], extrasaction="ignore")
+        w.writeheader()
+        w.writerows(sorted(filas, key=lambda f: f["id"]))
+    return len(nuevos)
 
 
 def procesar(video, salida, detector):
@@ -46,9 +70,10 @@ def procesar(video, salida, detector):
         ok, frame = cap.read()
         if not ok:
             break
-        if frame.shape[1] > ANCHO_MAX:
-            esc = ANCHO_MAX / frame.shape[1]
-            frame = cv2.resize(frame, (ANCHO_MAX, int(frame.shape[0] * esc)), interpolation=cv2.INTER_AREA)
+        # se reduce el video: la pose no necesita más resolución y es mucho más rápido
+        if frame.shape[1] > config.ANCHO_POSE:
+            esc = config.ANCHO_POSE / frame.shape[1]
+            frame = cv2.resize(frame, (config.ANCHO_POSE, int(frame.shape[0] * esc)), interpolation=cv2.INTER_AREA)
         h, w = frame.shape[:2]
         t = i / fps
         lm = detector.detectar(frame, t * 1000)
@@ -73,7 +98,7 @@ def main():
     if not videos:
         sys.exit(f"No encontré videos en {args.videos}")
     print(f"{len(videos)} videos encontrados en {args.videos}")
-    errores, nuevos = [], 0
+    errores, nuevos, validos = [], 0, []
     for v in videos:
         rel = v.relative_to(args.videos)
         try:
@@ -83,6 +108,7 @@ def main():
             continue
         persona = v.parent.name if v.parent != args.videos else "sin_nombre"
         salida = args.datos / persona / (v.stem + ".csv")
+        validos.append(f"{persona}/{v.stem}")
         if salida.exists() and salida.stat().st_mtime >= v.stat().st_mtime and not args.forzar:
             continue
         # un detector nuevo por video: el modo video de MediaPipe sigue a la persona entre frames
@@ -96,6 +122,10 @@ def main():
         except Exception as e:  # noqa: BLE001 - se reporta y se sigue con el resto
             errores.append(f"{rel}: {e}")
     print(f"\nListo: {nuevos} videos procesados. CSV en {args.datos}")
+    agregados = actualizar_conteos(args.datos, validos)
+    if agregados:
+        print(f"Se agregaron {agregados} filas a {args.datos / 'conteos_reales.csv'}: anoten las reps reales "
+              "en la columna reps_reales (las que tengan).")
     if errores:
         print(f"\n{len(errores)} video(s) con problemas (no se usaron):")
         for e in errores:
