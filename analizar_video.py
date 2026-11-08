@@ -1,5 +1,5 @@
 """Analiza un video con los modelos entrenados: reconoce el ejercicio, cuenta repeticiones
-y dice si cada una está bien o qué error tiene. Genera un video con el resultado dibujado.
+y dice si cada una está bien o mal. Genera un video con el resultado dibujado.
 
 Uso:
     python analizar_video.py --video prueba.mp4 --salida prueba_analizado.mp4 [--modelos /ruta/modelos]
@@ -40,8 +40,14 @@ def main():
                 out = cv2.VideoWriter(str(salida), cv2.VideoWriter_fourcc(*"mp4v"), fps,
                                       (frame.shape[1], frame.shape[0]))
             t = i / fps
-            lm = det.detectar(frame, t * 1000)
-            v = analizador.paso(pose.angulos(lm, frame.shape[1], frame.shape[0]), t)
+            # la pose se detecta al mismo ancho que al entrenar (extraer_videos.py); los puntos salen
+            # normalizados 0-1, así que se dibujan igual sobre el cuadro grande
+            chico = frame
+            if frame.shape[1] > config.ANCHO_POSE:
+                esc = config.ANCHO_POSE / frame.shape[1]
+                chico = cv2.resize(frame, (config.ANCHO_POSE, int(frame.shape[0] * esc)), interpolation=cv2.INTER_AREA)
+            lm = det.detectar(chico, t * 1000)
+            v = analizador.paso_pose(lm, chico.shape[1], chico.shape[0], t)
             if v:
                 estado = "BIEN" if v["ok"] else "MAL" if v["ok"] is False else "?"
                 print(f"  {t:6.1f}s  {config.EJERCICIOS[v['ejercicio']]['nombre']:15s} rep {v['rep']:2d}: "

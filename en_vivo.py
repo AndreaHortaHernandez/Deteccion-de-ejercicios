@@ -33,7 +33,7 @@ def main():
                 continue
             t = time.monotonic() - t0
             lm = det.detectar(frame, t * 1000)
-            analizador.paso(pose.angulos(lm, frame.shape[1], frame.shape[0]), t)
+            analizador.paso_pose(lm, frame.shape[1], frame.shape[0], t)
             pose.dibujar(frame, lm)
             analizador.dibujar_hud(frame, t)
             cv2.imshow("Deteccion de ejercicios", frame)
@@ -41,7 +41,7 @@ def main():
             if k == 27:
                 break
             if k in (ord("r"), ord("R")):
-                analizador = pose.Analizador(args.modelos)
+                analizador.reiniciar()
     cap.release()
     cv2.destroyAllWindows()
 
