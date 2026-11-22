@@ -60,6 +60,31 @@ def actualizar_conteos(dir_datos, ids):
     return len(nuevos)
 
 
+def importar_conteos_propios(dir_videos, dir_datos):
+    """grabar_webcam.py guarda las reps contadas en <videos>/<persona>/conteos.csv. Se pasan a
+    <datos>/conteos_reales.csv, solo en las filas que todavía no tienen reps anotadas."""
+    ruta = dir_datos / "conteos_reales.csv"
+    if not ruta.exists():
+        return 0
+    with open(ruta, encoding="utf-8") as fh:
+        filas = list(csv.DictReader(fh))
+    por_id = {f["id"]: f for f in filas}
+    n = 0
+    for c in sorted(dir_videos.glob("*/conteos.csv")):
+        with open(c, encoding="utf-8") as fh:
+            for f in csv.DictReader(fh):
+                destino = por_id.get(f.get("id", ""))
+                if destino is not None and not destino.get("reps_reales") and f.get("reps_reales"):
+                    destino["reps_reales"] = f["reps_reales"]
+                    n += 1
+    if n:
+        with open(ruta, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=["id", "ejercicio", "etiqueta", "reps_reales"], extrasaction="ignore")
+            w.writeheader()
+            w.writerows(filas)
+    return n
+
+
 def procesar(video, salida, detector):
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
@@ -126,6 +151,9 @@ def main():
     if agregados:
         print(f"Se agregaron {agregados} filas a {args.datos / 'conteos_reales.csv'}: anoten las reps reales "
               "en la columna reps_reales (las que tengan).")
+    importados = importar_conteos_propios(args.videos, args.datos)
+    if importados:
+        print(f"Se pasaron {importados} conteos de reps (conteos.csv de cada persona) a conteos_reales.csv.")
     if errores:
         print(f"\n{len(errores)} video(s) con problemas (no se usaron):")
         for e in errores:

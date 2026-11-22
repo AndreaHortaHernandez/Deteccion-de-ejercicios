@@ -122,7 +122,15 @@ duplican los datos para medir el contador.
 
 ## 6. Después de grabar
 
-1. Suban los videos a `MyDrive/deteccion_ejercicios/videos/<apellido_nombre>/`.
+1. Suban los videos a `MyDrive/deteccion_ejercicios/videos/<apellido_nombre>/`. Lo más fácil es
+   grabar con la webcam de una laptop (`grabar.bat`): guía en pantalla, graba sola, nombra los
+   videos y guarda las reps; cada quien sube su carpeta `videos/<apellido_nombre>/`
+   completa (trae `conteos.csv` con las reps) a la carpeta compartida del equipo. Con celular: graben con la
+   guía en vivo (`python guia_grabacion.py grabar --persona perez_ana --num 1`, o el paso 3b del
+   notebook), que además guarda las reps contadas; suban los videos del
+   celular tal cual a `celular/<apellido_nombre>/` y el paso 3b del notebook
+   (`guia_grabacion.py renombrar`) les pone el nombre y los mueve. Después `revisar` avisa si falta
+   alguno o si hay videos verticales, en cámara lenta o muy cortos.
 2. Notebook, paso 4 (**extraer pose**). Revisen al final:
    - "video(s) con problemas": casi siempre es un nombre mal escrito;
    - "[!] en N frames no se vio a la persona": si es más del 10 %, revisen el encuadre o

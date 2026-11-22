@@ -71,7 +71,7 @@ Nombre: `ejercicio__etiqueta__n.mp4` (doble guion bajo). La etiqueta es `bien`, 
 | `lagartija` | `cadera_caida`, `poco_profunda` |
 | `curl` | `balanceo`, `recorrido_parcial` |
 
-Un video con error cuenta como `mal` para el modelo de técnica y además entrena un modelo que dice **qué** error es, para que en vivo salga el mensaje específico ("Baja mas...", "Aprieta abdomen..."). Se necesitan al menos 2 errores grabados por 2 o más personas. `extraer_videos.py` crea `datos/conteos_reales.csv` con una fila por video para anotar las repeticiones reales.
+Un video con error cuenta como `mal` para el modelo de técnica y además entrena un modelo que dice **qué** error es, para que en vivo salga el mensaje específico ("Baja mas...", "Aprieta abdomen..."). Se necesitan al menos 2 errores grabados por 2 o más personas. Para grabar con la webcam de una laptop: doble clic en `grabar.bat` (`grabar_webcam.py`); guía cada paso en pantalla y guarda los videos ya con nombre. Si graban con celular, `guia_grabacion.py` guía la grabación paso a paso y guarda las reps contadas (`grabar`), genera el guion imprimible (`guion`), pone el nombre correcto a los videos del celular (`renombrar`) y los revisa antes de extraer la pose (`revisar`); en el notebook es el paso 3b. `extraer_videos.py` crea `datos/conteos_reales.csv` con una fila por video para anotar las repeticiones reales.
 
 ## Correrlo en Colab
 
@@ -121,6 +121,8 @@ Sin argumentos usa las carpetas `datos/`, `modelos/` y `salidas/` del repo. El m
 | `experimentos.py` | Comparación v1 vs. v2, ablaciones, curva de aprendizaje y robustez al punto de vista. |
 | `HALLAZGOS.md` | Resultados con el dataset real, diagnóstico y recomendaciones. |
 | `PROTOCOLO_GRABACION.md` | Cómo grabar videos propios con errores específicos y conteo real. |
+| `grabar_webcam.py` / `grabar.bat` | Graba los 9 videos de una persona con la webcam, guiando cada paso en pantalla; salen ya con nombre y guarda las reps contadas. |
+| `guia_grabacion.py` | Guía en vivo para grabar (y guarda las reps contadas), guion por persona, renombrado de los videos del celular y revisión antes de extraer la pose. |
 | `analizar_video.py` | Analiza un video y genera otro con el resultado dibujado. |
 | `colab_camara.py` | Cámara en vivo dentro de Colab. |
 | `en_vivo.py` | Cámara en vivo en una computadora. |
